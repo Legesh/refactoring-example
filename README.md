@@ -2,7 +2,7 @@
 
 ```
 > composer install
-> php index.php input.txt
+> php app.php input.txt
 ```
 
 ## Test the code
