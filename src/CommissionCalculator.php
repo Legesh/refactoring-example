@@ -1,55 +1,62 @@
 <?php
+
 namespace App;
+
+require 'vendor/autoload.php';
 
 use Exception;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
-use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
+use Monolog\Logger;
 
-class TransactionProcessor
+class CommissionCalculator
 {
+    const EU_COUNTRIES = [
+        'AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'ES', 'FI', 'FR', 'GR',
+        'HR', 'HU', 'IE', 'IT', 'LT', 'LU', 'LV', 'MT', 'NL', 'PO', 'PT', 'RO',
+        'SE', 'SI', 'SK'
+    ];
+
     private Client $client;
     private Logger $logger;
 
-    public function __construct()
+    public function __construct(Client $client = null)
     {
-        $this->client = new Client();
+        $this->client = $client ?? new Client();
         $this->logger = new Logger('TransactionProcessor');
         $this->logger->pushHandler(new StreamHandler('app.log', Logger::WARNING));
     }
 
-    public function process($filePath): void
+    /**
+     * @throws GuzzleException
+     */
+    public function calculateCommissions($filePath): void
     {
-        $transactions = explode("\n", file_get_contents($filePath));
-        foreach ($transactions as $row) {
-            if (empty($row)) {
-                continue;
-            }
-            $transaction = json_decode($row, true);
+        $rows = explode("\n", file_get_contents($filePath));
+        foreach ($rows as $row) {
             if (json_last_error() !== JSON_ERROR_NONE) {
                 $this->logger->warning("Invalid JSON: " . $row);
                 continue;
             }
 
+            if (empty($row)) {
+                continue;
+            }
+
+            $transaction = json_decode($row, true);
             $bin = $transaction['bin'];
-            $amount = $transaction['amount'];
+            $amount = (float)$transaction['amount'];
             $currency = $transaction['currency'];
 
             try {
-                $binData = $this->fetchBinData($bin);
-                $isEu = $this->isEu($binData->country->alpha2);
+                $countryCode = $this->fetchCountryCodeFromBin($bin);
+                $isEu = $this->isEuCountry($countryCode);
                 $rate = $this->fetchExchangeRate($currency);
+                $amountInEur = $this->convertAmountToEur($amount, $currency, $rate);
 
-                if ($currency == 'EUR' || $rate == 0) {
-                    $amountFixed = $amount;
-                } else {
-                    $amountFixed = $amount / $rate;
-                }
-
-                $commission = ceil($amountFixed * ($isEu ? 0.01 : 0.02) * 100) / 100;
-                echo $commission . "\n";
-
+                $commission = $this->calculateTransactionCommission($amountInEur, $isEu);
+                echo number_format($commission, 2, '.', '') . "\n";
             } catch (Exception $e) {
                 $this->logger->error($e->getMessage());
             }
@@ -60,36 +67,47 @@ class TransactionProcessor
      * @throws GuzzleException
      * @throws Exception
      */
-    private function fetchBinData($bin)
+    public function fetchCountryCodeFromBin($bin): ?string
     {
         $response = $this->client->get('https://lookup.binlist.net/' . $bin);
         if ($response->getStatusCode() !== 200) {
             throw new Exception('Error fetching BIN data');
         }
-        return json_decode($response->getBody());
+        $data = json_decode($response->getBody(), true);
+        return $data['country']['alpha2'] ?? null;
+    }
+
+    public function isEuCountry($countryCode): bool
+    {
+        return in_array($countryCode, self::EU_COUNTRIES);
     }
 
     /**
      * @throws GuzzleException
-     * @throws Exception
      */
-    private function fetchExchangeRate($currency)
+    public function fetchExchangeRate($currency): float
     {
-        $response = $this->client->get('https://api.exchangeratesapi.io/latest');
-        if ($response->getStatusCode() !== 200) {
-            throw new Exception('Error fetching exchange rate');
+        if ($currency == 'EUR') {
+            return 1;
         }
-        $rates = json_decode($response->getBody(), true)['rates'];
-        return $rates[$currency] ?? 0;
+
+        $response = $this->client->get('http://api.exchangeratesapi.io/latest?access_key=3b23be8e4c265b7bf519575b30ae7027');
+        $data = json_decode($response->getBody(), true);
+        return $data['rates'][$currency] ?? 0;
     }
 
-    private function isEu($countryCode): bool
+    public function convertAmountToEur($amount, $currency, $rate): float
     {
-        $euCountries = [
-            'AT', 'BE', 'BG', 'CY', 'CZ', 'DE', 'DK', 'EE', 'ES', 'FI', 'FR', 'GR',
-            'HR', 'HU', 'IE', 'IT', 'LT', 'LU', 'LV', 'MT', 'NL', 'PO', 'PT', 'RO',
-            'SE', 'SI', 'SK'
-        ];
-        return in_array($countryCode, $euCountries);
+        if ($currency == 'EUR') {
+            return $amount;
+        }
+
+        return $rate > 0 ? $amount / $rate : 0;
+    }
+
+    public function calculateTransactionCommission($amount, $isEu): float
+    {
+        $rate = $isEu ? 0.01 : 0.02;
+        return ceil($amount * $rate * 100) / 100;
     }
 }
